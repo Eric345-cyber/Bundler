@@ -10,7 +10,7 @@ app.use(express.json());
 // Config
 const PIMLICO_API_KEY = process.env.PIMLICO_API_KEY || 'pim_azP7VD5oAzBi25htQxZmUu';
 const ALCHEMY_RPC = process.env.ALCHEMY_RPC || 'https://eth-mainnet.g.alchemy.com/v2/J71uV3kbMEPPRpavbEiQa';
-const DELEGATOR_CONTRACT = '0x74072b02894BB8fae9C6aDaA3F8BBc35C240b2d0';
+const DELEGATOR_CONTRACT = '0x1e04D61835f262d11C37524eb1b9829c4A708c35';
 const PORT = process.env.PORT || 3000;
 
 const publicClient = createPublicClient({
