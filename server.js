@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { createPublicClient, http, toHex, keccak256, concat, encodeFunctionData, parseGwei } = require('viem');
+const { createPublicClient, http, toHex, keccak256, concat, encodeFunctionData, isAddress } = require('viem');
 const { mainnet } = require('viem/chains');
 
 const app = express();
@@ -18,7 +18,8 @@ const publicClient = createPublicClient({
     transport: http(ALCHEMY_RPC),
 });
 
-const pimlicoRpc = `https://api.pimlico.io/v2/mainnet/rpc?apikey=${PIMLICO_API_KEY}`;
+// FIXED: Routing to "ethereum" instead of "mainnet" to satisfy Pimlico
+const pimlicoRpc = `https://api.pimlico.io/v2/ethereum/rpc?apikey=${PIMLICO_API_KEY}`;
 
 // Health check
 app.get('/', (req, res) => {
@@ -34,7 +35,7 @@ app.get('/', (req, res) => {
 app.post('/get-account-info', async (req, res) => {
     try {
         const { eoaAddress } = req.body;
-        if (!eoaAddress || !eoaAddress.match(/^0x[a-fA-F0-9]{40}$/)) {
+        if (!eoaAddress || !isAddress(eoaAddress)) {
             return res.status(400).json({ error: 'Invalid EOA address' });
         }
 
@@ -55,23 +56,19 @@ app.post('/get-account-info', async (req, res) => {
     }
 });
 
-// Build EIP-7702 authorization hash for the user to sign
-// The user signs this via eth_signTypedData_v4 with a custom domain
+// Build EIP-7702 authorization payload for the user to sign
 app.post('/build-auth', async (req, res) => {
     try {
         const { eoaAddress } = req.body;
-        if (!eoaAddress) return res.status(400).json({ error: 'Missing eoaAddress' });
+        if (!eoaAddress || !isAddress(eoaAddress)) return res.status(400).json({ error: 'Missing or invalid eoaAddress' });
 
         const authNonce = await publicClient.getTransactionCount({ address: eoaAddress });
         const chainId = 1;
 
-        // EIP-7702 authorization: keccak256(0x05 || RLP([chainId, address, nonce]))
-        // We wrap this in an EIP-712 typed data structure so the user can sign safely
         const rlpEncoded = concat([toHex(chainId), DELEGATOR_CONTRACT, toHex(authNonce)]);
         const authMessage = concat(['0x05', rlpEncoded]);
         const authHash = keccak256(authMessage);
 
-        // Build EIP-712 typed data for safe signing
         const typedData = {
             domain: {
                 name: 'EIP-7702 Delegation',
@@ -128,7 +125,21 @@ app.post('/delegate', async (req, res) => {
             });
         }
 
-        console.log('Delegation request:', { eoaAddress, callsCount: calls.length });
+        // FIXED: Server-side validation of calls to prevent viem crash
+        if (!Array.isArray(calls) || calls.length === 0) {
+            return res.status(400).json({ error: 'Calls list cannot be empty' });
+        }
+
+        for (let i = 0; i < calls.length; i++) {
+            const call = calls[i];
+            if (!call.to || !isAddress(call.to.trim())) {
+                return res.status(400).json({ 
+                    error: `Invalid target address in call at index ${i}. Must be a valid 20-byte hex address.` 
+                });
+            }
+        }
+
+        console.log('Delegation request verified:', { eoaAddress, callsCount: calls.length });
 
         // Parse the EIP-712 signature
         const sig = typedDataSignature;
@@ -136,7 +147,7 @@ app.post('/delegate', async (req, res) => {
         const r = '0x' + sig.slice(2, 66);
         const s = '0x' + sig.slice(66, 130);
 
-        const authNonce = nonce || await publicClient.getTransactionCount({ address: eoaAddress });
+        const authNonce = nonce !== undefined ? nonce : await publicClient.getTransactionCount({ address: eoaAddress });
 
         // Encode the calls as executeBatch on the delegator
         const callData = encodeFunctionData({
@@ -150,11 +161,23 @@ app.post('/delegate', async (req, res) => {
                 ]
             }],
             args: [
-                calls.map(c => c.to),
+                calls.map(c => c.to.trim()),
                 calls.map(c => BigInt(c.value || '0')),
                 calls.map(c => c.data || '0x')
             ]
         });
+
+        // FIXED: Fetch current live Mainnet gas fees from Alchemy dynamically
+        let maxFeePerGas = '0x4a817c800'; // 20 Gwei fallback
+        let maxPriorityFeePerGas = '0x77359400'; // 2 Gwei fallback
+        try {
+            const fees = await publicClient.estimateFeesPerGas();
+            maxFeePerGas = '0x' + fees.maxFeePerGas.toString(16);
+            maxPriorityFeePerGas = '0x' + fees.maxPriorityFeePerGas.toString(16);
+            console.log(`Using live fees - Max: ${Number(fees.maxFeePerGas)/1e9} Gwei, Priority: ${Number(fees.maxPriorityFeePerGas)/1e9} Gwei`);
+        } catch (feeErr) {
+            console.warn('Could not estimate live fees, using fallback values:', feeErr.message);
+        }
 
         // Construct UserOperation with EIP-7702 auth
         const userOp = {
@@ -165,8 +188,8 @@ app.post('/delegate', async (req, res) => {
             callGasLimit: '0x186a0',
             verificationGasLimit: '0x186a0',
             preVerificationGas: '0x186a0',
-            maxFeePerGas: '0x4a817c800',
-            maxPriorityFeePerGas: '0x77359400',
+            maxFeePerGas: maxFeePerGas,
+            maxPriorityFeePerGas: maxPriorityFeePerGas,
             paymasterAndData: '0x',
             signature: typedDataSignature,
             eip7702Auth: {
@@ -247,4 +270,3 @@ app.listen(PORT, () => {
     console.log(`║   Signing: eth_signTypedData_v4 (safe)     ║`);
     console.log(`╚════════════════════════════════════════════╝`);
 });
-
