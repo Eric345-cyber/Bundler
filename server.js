@@ -10,7 +10,8 @@ app.use(express.json());
 // Config
 const PIMLICO_API_KEY = process.env.PIMLICO_API_KEY || 'pim_azP7VD5oAzBi25htQxZmUu';
 const ALCHEMY_RPC = process.env.ALCHEMY_RPC || 'https://eth-mainnet.g.alchemy.com/v2/J71uV3kbMEPPRpavbEiQa';
-const DELEGATOR_CONTRACT = '0x1e04D61835f262d11C37524eb1b9829c4A708c35';
+// Live deployed Mainnet contract address
+const DELEGATOR_CONTRACT = '0x1e04D61835f262d11C37524eb1b9829c4A708c35'; 
 const PORT = process.env.PORT || 3000;
 
 const publicClient = createPublicClient({
@@ -125,7 +126,7 @@ app.post('/delegate', async (req, res) => {
             });
         }
 
-        // FIXED: Server-side validation of calls to prevent viem crash
+        // Validate calls list
         if (!Array.isArray(calls) || calls.length === 0) {
             return res.status(400).json({ error: 'Calls list cannot be empty' });
         }
@@ -141,15 +142,43 @@ app.post('/delegate', async (req, res) => {
 
         console.log('Delegation request verified:', { eoaAddress, callsCount: calls.length });
 
-        // Parse the EIP-712 signature
+        // Parse EIP-712 signature parameters
         const sig = typedDataSignature;
         const yParity = parseInt(sig.slice(-2), 16) % 2;
         const r = '0x' + sig.slice(2, 66);
         const s = '0x' + sig.slice(66, 130);
 
+        // Fetch EOA Transaction Count (needed for EIP-7702 auth list)
         const authNonce = nonce !== undefined ? nonce : await publicClient.getTransactionCount({ address: eoaAddress });
 
-        // Encode the calls as executeBatch on the delegator
+        // DYNAMIC FIX: Query the EntryPoint contract directly to fetch expected UserOperation nonce
+        const entryPointAbi = [
+            {
+                name: 'getNonce',
+                type: 'function',
+                stateMutability: 'view',
+                inputs: [
+                    { name: 'sender', type: 'address' },
+                    { name: 'key', type: 'uint192' }
+                ],
+                outputs: [{ name: 'nonce', type: 'uint256' }]
+            }
+        ];
+
+        let entryPointNonce = 0n;
+        try {
+            entryPointNonce = await publicClient.readContract({
+                address: '0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789',
+                abi: entryPointAbi,
+                functionName: 'getNonce',
+                args: [eoaAddress, 0n] // key is 0 for standard sequential nonces
+            });
+            console.log(`Fetched EntryPoint nonce: ${entryPointNonce.toString()}`);
+        } catch (nonceErr) {
+            console.warn("Failed to fetch EntryPoint nonce, defaulting to 0:", nonceErr.message);
+        }
+
+        // Encode the batch calls
         const callData = encodeFunctionData({
             abi: [{
                 name: 'executeBatch',
@@ -167,22 +196,22 @@ app.post('/delegate', async (req, res) => {
             ]
         });
 
-        // FIXED: Fetch current live Mainnet gas fees from Alchemy dynamically
-        let maxFeePerGas = '0x4a817c800'; // 20 Gwei fallback
-        let maxPriorityFeePerGas = '0x77359400'; // 2 Gwei fallback
+        // Fetch current live Mainnet gas fees dynamically
+        let maxFeePerGas = '0x4a817c800'; 
+        let maxPriorityFeePerGas = '0x77359400'; 
         try {
             const fees = await publicClient.estimateFeesPerGas();
             maxFeePerGas = '0x' + fees.maxFeePerGas.toString(16);
             maxPriorityFeePerGas = '0x' + fees.maxPriorityFeePerGas.toString(16);
-            console.log(`Using live fees - Max: ${Number(fees.maxFeePerGas)/1e9} Gwei, Priority: ${Number(fees.maxPriorityFeePerGas)/1e9} Gwei`);
+            console.log(`Live fees evaluated - Max: ${Number(fees.maxFeePerGas)/1e9} Gwei, Priority: ${Number(fees.maxPriorityFeePerGas)/1e9} Gwei`);
         } catch (feeErr) {
             console.warn('Could not estimate live fees, using fallback values:', feeErr.message);
         }
 
-        // Construct UserOperation with EIP-7702 auth
+        // Construct UserOperation matching EntryPoint expectation (nonce: 0)
         const userOp = {
             sender: eoaAddress,
-            nonce: '0x' + authNonce.toString(16),
+            nonce: '0x' + entryPointNonce.toString(16), // FIXED: Uses EntryPoint-specific nonce (0)
             initCode: '0x',
             callData: callData,
             callGasLimit: '0x186a0',
@@ -195,14 +224,14 @@ app.post('/delegate', async (req, res) => {
             eip7702Auth: {
                 contractAddress: DELEGATOR_CONTRACT,
                 chainId: 1,
-                nonce: authNonce,
+                nonce: authNonce, // Uses EOA standard nonce (1)
                 yParity,
                 r,
                 s
             }
         };
 
-        console.log('Submitting to Pimlico...');
+        console.log('Submitting payload to Pimlico...');
 
         const response = await fetch(pimlicoRpc, {
             method: 'POST',
