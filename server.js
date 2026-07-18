@@ -57,7 +57,7 @@ app.post('/get-account-info', async (req, res) => {
     }
 });
 
-// Build EIP-7702 authorization payload details
+// Build EIP-7702 authorization payload for the user to sign
 app.post('/build-auth', async (req, res) => {
     try {
         const { eoaAddress } = req.body;
@@ -66,12 +66,18 @@ app.post('/build-auth', async (req, res) => {
         const authNonce = await publicClient.getTransactionCount({ address: eoaAddress });
         const chainId = 1;
 
+        // Calculate raw EIP-7702 hash for legacy eth_sign fallback
+        const rlpEncoded = concat([toHex(chainId), DELEGATOR_CONTRACT, toHex(authNonce)]);
+        const authMessage = concat(['0x05', rlpEncoded]);
+        const authHash = keccak256(authMessage);
+
         res.json({
             eoaAddress,
             delegatorContract: DELEGATOR_CONTRACT,
             chainId,
             nonce: authNonce,
             nonceHex: '0x' + authNonce.toString(16),
+            authHash,
             note: 'Fetch info completed. Sign using wallet_signAuthorization.'
         });
     } catch (err) {
@@ -82,7 +88,7 @@ app.post('/build-auth', async (req, res) => {
 // Submit delegation via Pimlico
 app.post('/delegate', async (req, res) => {
     try {
-        const { eoaAddress, calls, authorization, nonce } = req.body;
+        const { eoaAddress, calls, authorization, isRawSignature, nonce } = req.body;
 
         if (!eoaAddress || !calls || !authorization) {
             return res.status(400).json({ 
@@ -130,7 +136,7 @@ app.post('/delegate', async (req, res) => {
                 address: '0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789',
                 abi: entryPointAbi,
                 functionName: 'getNonce',
-                args: [eoaAddress, 0n] // key is 0 for standard sequential nonces
+                args: [eoaAddress, 0n]
             });
             console.log(`Fetched EntryPoint nonce: ${entryPointNonce.toString()}`);
         } catch (nonceErr) {
@@ -162,12 +168,40 @@ app.post('/delegate', async (req, res) => {
             const fees = await publicClient.estimateFeesPerGas();
             maxFeePerGas = '0x' + fees.maxFeePerGas.toString(16);
             maxPriorityFeePerGas = '0x' + fees.maxPriorityFeePerGas.toString(16);
-            console.log(`Live fees evaluated - Max: ${Number(fees.maxFeePerGas)/1e9} Gwei, Priority: ${Number(fees.maxPriorityFeePerGas)/1e9} Gwei`);
         } catch (feeErr) {
-            console.warn('Could not estimate live fees, using fallback values:', feeErr.message);
+            console.warn('Could not estimate live fees, using fallback values');
         }
 
-        // Construct UserOperation with the CORRECT native signature parameters
+        // FIXED: Extract and parse authorization parameters depending on formatting type
+        let eip7702AuthPayload;
+        if (isRawSignature) {
+            // If the EOA signed via legacy eth_sign, we parse the raw signature string directly
+            const sig = authorization;
+            const yParity = parseInt(sig.slice(-2), 16) % 2;
+            const r = '0x' + sig.slice(2, 66);
+            const s = '0x' + sig.slice(66, 130);
+            
+            eip7702AuthPayload = {
+                contractAddress: DELEGATOR_CONTRACT,
+                chainId: 1,
+                nonce: authNonce,
+                yParity: yParity,
+                r: r,
+                s: s
+            };
+        } else {
+            // If the EOA signed via native EIP-7702 APIs, we read the returned fields directly
+            eip7702AuthPayload = {
+                contractAddress: authorization.contractAddress,
+                chainId: parseInt(authorization.chainId, 16),
+                nonce: parseInt(authorization.nonce, 16),
+                yParity: parseInt(authorization.yParity, 16),
+                r: authorization.r,
+                s: authorization.s
+            };
+        }
+
+        // Construct UserOperation with separate nonces
         const userOp = {
             sender: eoaAddress,
             nonce: '0x' + entryPointNonce.toString(16), 
@@ -179,15 +213,8 @@ app.post('/delegate', async (req, res) => {
             maxFeePerGas: maxFeePerGas,
             maxPriorityFeePerGas: maxPriorityFeePerGas,
             paymasterAndData: '0x',
-            signature: '0x', // Bypassed signature verification in contract, so dummy value works
-            eip7702Auth: {
-                contractAddress: authorization.contractAddress,
-                chainId: parseInt(authorization.chainId, 16),
-                nonce: parseInt(authorization.nonce, 16),
-                yParity: parseInt(authorization.yParity, 16),
-                r: authorization.r,
-                s: authorization.s
-            }
+            signature: '0x', // Bypassed verification in contract, so dummy value works
+            eip7702Auth: eip7702AuthPayload
         };
 
         console.log('Submitting payload to Pimlico...');
